@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,8 @@ type Raft struct {
 	lastApplied int
 	nextApplied []int
 	matchIndex []int
+	electionTicker *time.Ticker
+	heartbeatTicker *time.Ticker
 }
 
 // return currentTerm and whether this server
@@ -152,29 +155,34 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if rf.electionState == "Leader" {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-	if  rf.currentTerm > args.Term {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
-
-	if rf.currentTerm <= args.Term {
-		rf.mu.Lock()
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		rf.mu.Unlock()
-		reply.Term = args.CandidateId
-		reply.VoteGranted = true
-		return
-	}
-
-	return
+	rf.mu.Lock()
+    defer rf.mu.Unlock()
+    
+    reply.Term = rf.currentTerm
+    reply.VoteGranted = false
+    
+    // If candidate's term is older, reject
+    if args.Term < rf.currentTerm {
+        return
+    }
+    
+    // If candidate's term is newer, update our term and reset vote
+    if args.Term > rf.currentTerm {
+        rf.currentTerm = args.Term
+        rf.votedFor = -1
+        rf.electionState = "Follower"
+    }
+    
+    // Grant vote if we haven't voted or already voted for this candidate
+    if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+        rf.votedFor = args.CandidateId
+        reply.VoteGranted = true
+        reply.Term = rf.currentTerm
+        
+        // Reset election timer when granting vote
+        ms := getRandTimeVal()
+        rf.electionTicker.Reset(time.Duration(ms) * time.Millisecond)
+    }
 }
 
 type AppendEntriesArgs struct {
@@ -194,6 +202,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm || rf.electionState == "Leader" {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -201,13 +211,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if (rf.electionState == "Candidate" || rf.electionState == "Follower") && rf.currentTerm <= args.Term {
-		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = args.LeaderId
 		rf.electionState = "Follower"
-		rf.mu.Unlock()
 		reply.Success = true
 		reply.Term = args.Term
+		ms := getRandTimeVal()
+		rf.electionTicker.Reset(time.Duration(ms) * time.Millisecond)
 		return 
 	}
 }
@@ -292,119 +302,144 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
-		if rf.electionState == "Leader" {
-			appendArgs := AppendEntriesArgs{}
-			appendReply := AppendEntriesReply{}
-
-			appendArgs.LeaderId = rf.me
-			appendArgs.Term = rf.currentTerm
-
-			for idx, _ := range rf.peers {
-				if rf.electionState == "Follower" {
-					break
-				}
-
-				ok := rf.sendAppendEntries(idx, &appendArgs, &appendReply)
-
-				if ok {
-
-				}
-			}
-
-			ms := 50
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-		}
-
-		// Your code here (2A)
-		// Check if a leader election should be started.
-		if rf.electionState == "Follower" {
-			rf.mu.Lock()
-
-			rf.electionState = "Candidate"
-			rf.currentTerm += 1
-			rf.votedFor = rf.me
-
-			args := RequestVoteArgs{}
-			args.CandidateId = rf.me
-			args.Term = rf.currentTerm
-
-			rf.mu.Unlock()
-
-			reply := RequestVoteReply{}
-			totalVotes := 1
-
-			for idx, _ := range rf.peers {
-				if rf.electionState == "Follower" {
-					break
-				}
-				ok := rf.sendRequestVote(idx, &args, &reply)
-
-				if ok {
-					if reply.VoteGranted && reply.Term == rf.currentTerm {
-						totalVotes += 1
-					} 
-				}
-			}
-
-			if rf.electionState == "Candidate" && totalVotes >= len(rf.peers) / 2 + 1 {
-				rf.mu.Lock()
-				rf.electionState = "Leader"
-				rf.mu.Unlock()
-
-				appendArgs := AppendEntriesArgs{}
-				appendReply := AppendEntriesReply{}
-
-				appendArgs.LeaderId = rf.me
-				appendArgs.Term = rf.currentTerm
-
-				agreement := 1
-		
-				for idx, _ := range rf.peers {
-					if rf.electionState == "Follower" {
-						break
-					}
-
-					ok := rf.sendAppendEntries(idx, &appendArgs, &appendReply)
-
-					if ok {
-						if appendReply.Success && appendReply.Term <= rf.currentTerm {
-							agreement += 1
-						}
-					}
-				}
-
-				if agreement >= len(rf.peers) / 2 + 1 {
-					break
-				} else {
-					rf.mu.Lock()
-					rf.electionState = "Follower"
-					rf.mu.Unlock()
-				}
-			}
-
-			// pause for a random amount of time between 50 and 350
-			// milliseconds.
-			ms := 50 + (rand.Int63() % 300)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-		}
-
-	}
+func getRandTimeVal() int64 {
+	return 50 + (rand.Int63() % 300);
 }
 
-func getNextElectionState(idx int) string {
-	switch idx {
-	case 0:
-		return "Follower"
-	case 1:
-		return "Candidate"
-	case 2:
-		return "Leader"
+func (rf *Raft) sendReqVoteWg(server int, ch chan RequestVoteReply, wg *sync.WaitGroup) {
+	reply := RequestVoteReply{}
+
+	reqVotes := RequestVoteArgs{}
+	reqVotes.Term = rf.currentTerm
+	reqVotes.CandidateId = rf.me
+
+	rf.sendRequestVote(server, &reqVotes, &reply);
+	ch <- reply
+
+	wg.Done()
+}
+
+func (rf *Raft) sendHeartbeatWg(server int, ch chan AppendEntriesReply, wg *sync.WaitGroup) {
+	reply := AppendEntriesReply{}
+
+	hb := AppendEntriesArgs{}
+	hb.Term = rf.currentTerm
+	hb.LeaderId = rf.me
+
+	rf.sendAppendEntries(server, &hb, &reply);
+	ch <- reply
+
+	wg.Done()
+}
+
+func (rf *Raft) sendHeartbeats() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.electionState != "Leader" {
+		rf.heartbeatTicker.Stop()
+		return
 	}
-	return ""
-} 
+
+	ch := make(chan AppendEntriesReply, len(rf.peers) - 1)
+
+	wg := sync.WaitGroup{}
+
+	for idx, _ := range rf.peers  {
+		if (idx == rf.me)  {
+			continue
+		}
+        wg.Add(1)
+
+        //now we spawn a goroutine
+        go rf.sendHeartbeatWg(idx, ch, &wg);
+    }
+
+    wg.Wait()
+
+    close(ch)
+
+	ms := getRandTimeVal()
+	rf.heartbeatTicker.Reset(time.Duration(50) * time.Millisecond)
+	rf.electionTicker.Reset(time.Duration(ms) * time.Millisecond)
+	return
+}	
+
+func (rf *Raft) startElectionAttempt() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.electionState == "Leader" {
+		return
+	}
+
+	if (rf.electionState == "Follower" || rf.electionState == "Candidate") {
+		rf.electionState = "Candidate"
+		rf.currentTerm += 1
+	}
+
+	totalVotes := 1
+	rf.votedFor = rf.me
+
+	ch := make(chan RequestVoteReply, len(rf.peers) - 1)
+
+	wg := sync.WaitGroup{}
+
+	for idx, _ := range rf.peers  {
+		if (idx == rf.me)  {
+			continue
+		}
+        wg.Add(1)
+
+        //now we spawn a goroutine
+        go rf.sendReqVoteWg(idx, ch, &wg);
+    }
+
+    // now we wait for everyone to finish - again, not a must.
+    // you can just receive from the channel N times, and use a timeout or something for safety
+    wg.Wait()
+
+    // we need to close the channel or the following loop will get stuck
+    close(ch)
+
+	for val := range ch {
+		if val.VoteGranted && val.Term == rf.currentTerm {
+			totalVotes += 1;
+		}
+	}
+
+	if totalVotes >= len(rf.peers) / 2 {
+		rf.electionState = "Leader"
+		rf.heartbeatTicker = time.NewTicker(time.Duration(50) * time.Millisecond)
+		return
+	}
+
+	rf.electionState = "Follower"
+	ms := getRandTimeVal()
+	rf.electionTicker.Reset(time.Duration(ms) * time.Millisecond)
+	return
+}
+
+func (rf *Raft) ticker() {
+	if rf.electionTicker != nil {
+        defer rf.electionTicker.Stop()
+    }
+    if rf.heartbeatTicker != nil {
+        defer rf.heartbeatTicker.Stop()
+    }
+	for rf.killed() == false {
+		select {
+		case <- rf.electionTicker.C: 
+			go rf.startElectionAttempt()
+		case <- rf.heartbeatTicker.C:
+			go rf.sendHeartbeats()
+		}
+	}		
+}
+
+// We need to rewrite with tickers instead of trying to manage states with normal for loops.
+// func (t *time.Ticker) resetTicker() {
+//     t.ticker = *time.NewTicker(t.period)
+// }
 
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -429,12 +464,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.electionState = "Follower"
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	ms := getRandTimeVal()
+	rf.electionTicker = time.NewTicker(time.Duration(ms) * time.Millisecond)
+	rf.heartbeatTicker = time.NewTicker(time.Duration(ms) * time.Millisecond)
 	go rf.ticker()
-
 
 	return rf
 }
